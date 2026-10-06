@@ -48,46 +48,95 @@ curl -s -X PUT "$BASE/api/drills/$DID/records/T1/3" -H "$ctype" -d '{
 }'; echo
 curl -s "$BASE/api/drills/$DID/records/T1/3"; echo
 
-echo "## 7. T2 只报了序号 2 => 缺号 1 未闭合时封存被拒绝（409）"
+echo "## 7. 处置依赖：建立 T1#1->T1#2、T1#2->T1#3（附非空依据）；幂等/校验/查询"
+curl -s -X POST "$BASE/api/drills/$DID/dependencies" -H "$ctype" -d '{
+  "predecessor": {"terminal_code": "T1", "seq": 1},
+  "successor":   {"terminal_code": "T1", "seq": 2},
+  "reason": "终端上线自检通过后，水位数据方可采信",
+  "created_by": "现场指挥"
+}'; echo
+curl -s -X POST "$BASE/api/drills/$DID/dependencies" -H "$ctype" -d '{
+  "predecessor": {"terminal_code": "T1", "seq": 2},
+  "successor":   {"terminal_code": "T1", "seq": 3},
+  "reason": "水位确认后才启动堤段巡查"
+}'; echo
+echo "-- 重复提交（幂等，already_exists: true）"
+curl -s -X POST "$BASE/api/drills/$DID/dependencies" -H "$ctype" -d '{
+  "predecessor": {"terminal_code": "T1", "seq": 1},
+  "successor":   {"terminal_code": "T1", "seq": 2},
+  "reason": "终端上线自检通过后，水位数据方可采信"
+}'; echo
+echo "-- 成环 T1#3->T1#1 => 409 dependency_cycle"
+curl -s -X POST "$BASE/api/drills/$DID/dependencies" -H "$ctype" -d '{
+  "predecessor": {"terminal_code": "T1", "seq": 3},
+  "successor":   {"terminal_code": "T1", "seq": 1},
+  "reason": "试图成环"
+}'; echo
+echo "-- 缺号端点 T2#1 => 404 record_not_found"
+curl -s -X POST "$BASE/api/drills/$DID/dependencies" -H "$ctype" -d '{
+  "predecessor": {"terminal_code": "T2", "seq": 1},
+  "successor":   {"terminal_code": "T1", "seq": 1},
+  "reason": "缺号不能作为端点"
+}'; echo
+echo "-- T1#3 依赖视图：直接前置/后续 + 沿前置方向完整链"
+curl -s "$BASE/api/drills/$DID/records/T1/3/dependencies"; echo
+curl -s "$BASE/api/drills/$DID/dependencies"; echo
+
+echo "## 8. T2 只报了序号 2 => 缺号 1 未闭合时封存被拒绝（409）"
 curl -s -X POST "$BASE/api/drills/$DID/terminals/T2/reports" -H "$ctype" -d '{
   "entries": [{"seq": 2, "occurred_at": "2026-10-05T09:15:00Z", "event_type": "water_level", "content": "水位 21.6m"}]
 }'; echo
 curl -s -X POST "$BASE/api/drills/$DID/seals" -H "$ctype" -d '{"note":"尝试封存"}'; echo
 
-echo "## 8. 逐号确认 T2 的缺号 1 丢失"
+echo "## 9. 逐号确认 T2 的缺号 1 丢失"
 curl -s -X POST "$BASE/api/drills/$DID/terminals/T2/gaps/lost" -H "$ctype" \
   -d '{"seq":1,"reason":"离线缓存损坏无法恢复","confirmed_by":"保障组"}'; echo
 
-echo "## 9. 缺号全部闭合 => 封存版本 1（不可变）"
+echo "## 10. 缺号全部闭合 => 封存版本 1（不可变，dependencies 含当时依赖及依据）"
 curl -s -X POST "$BASE/api/drills/$DID/seals" -H "$ctype" -d '{"note":"演练结束封存"}'; echo
 
-echo "## 10. 封存后迟到上报：当前时间线接纳，封存版本不变"
+echo "## 11. 封存后：迟到上报 + 依赖增删只影响当前视图（撤销 T1#2->T1#3，新建 T1#1->T1#3）"
 curl -s -X POST "$BASE/api/drills/$DID/terminals/T3/reports" -H "$ctype" -d '{
   "entries": [{"seq": 1, "occurred_at": "2026-10-05T09:40:00Z", "event_type": "command", "content": "指挥车回撤指令回执（迟到补报）"}]
 }'; echo
+curl -s -X DELETE "$BASE/api/drills/$DID/dependencies" -H "$ctype" -d '{
+  "predecessor": {"terminal_code": "T1", "seq": 2},
+  "successor":   {"terminal_code": "T1", "seq": 3}
+}'; echo
+echo "-- 重复撤销（幂等，already_revoked: true）"
+curl -s -X DELETE "$BASE/api/drills/$DID/dependencies" -H "$ctype" -d '{
+  "predecessor": {"terminal_code": "T1", "seq": 2},
+  "successor":   {"terminal_code": "T1", "seq": 3}
+}'; echo
+curl -s -X POST "$BASE/api/drills/$DID/dependencies" -H "$ctype" -d '{
+  "predecessor": {"terminal_code": "T1", "seq": 1},
+  "successor":   {"terminal_code": "T1", "seq": 3},
+  "reason": "上线自检通过后可直接进入巡查阶段"
+}'; echo
 curl -s "$BASE/api/drills/$DID/seals/1"; echo
+curl -s "$BASE/api/drills/$DID/dependencies"; echo
 curl -s "$BASE/api/drills/$DID/timeline"; echo
 
-echo "## 11. 错误场景"
+echo "## 12. 错误场景"
 curl -s -X POST "$BASE/api/drills/$DID/terminals/GHOST/reports" -H "$ctype" \
   -d '{"entries":[{"seq":1,"occurred_at":"2026-10-05T09:00:00Z","event_type":"x","content":"y"}]}'; echo
 curl -s -X POST "$BASE/api/drills/$DID/terminals/T1/reports" -H "$ctype" \
   -d '{"entries":[{"seq":-1,"occurred_at":"2026-10-05T09:00:00Z","event_type":"x","content":"y"}]}'; echo
 
-echo "## 12. 主动完成：T3 缺号 2 未闭合 => 409 unresolved_gaps，不生成封存版本"
+echo "## 13. 主动完成：T3 缺号 2 未闭合 => 409 unresolved_gaps，不生成封存版本"
 curl -s -X POST "$BASE/api/drills/$DID/terminals/T3/reports" -H "$ctype" -d '{
   "entries": [{"seq": 3, "occurred_at": "2026-10-05T09:50:00Z", "event_type": "command", "content": "指挥车就位回执"}]
 }'; echo
 curl -s -X POST "$BASE/api/drills/$DID/complete" -H "$ctype" -d '{"completed_by":"演练负责人"}'; echo
 
-echo "## 13. 逐号确认 T3#2 丢失后完成 => 原子生成最终封存版本并转为已完成（201）"
+echo "## 14. 逐号确认 T3#2 丢失后完成 => 原子生成最终封存版本并转为已完成（201，含当前依赖）"
 curl -s -X POST "$BASE/api/drills/$DID/terminals/T3/gaps/lost" -H "$ctype" \
   -d '{"seq":2,"reason":"终端掉电未缓存","confirmed_by":"保障组"}'; echo
 curl -s -X POST "$BASE/api/drills/$DID/complete" -H "$ctype" \
   -d '{"note":"演练正式收官","completed_by":"张指挥"}'; echo
 curl -s "$BASE/api/drills/$DID"; echo
 
-echo "## 14. 完成后：登记/非重复上报/更正/缺号确认/再封存一律拒绝；重试仍 duplicate；冲突不新增证据"
+echo "## 15. 完成后：登记/非重复上报/更正/缺号确认/再封存/依赖变更一律拒绝；重试仍 duplicate；冲突不新增证据"
 curl -s -X POST "$BASE/api/drills/$DID/terminals" -H "$ctype" -d '{"terminals":[{"code":"T9"}]}'; echo
 curl -s -X POST "$BASE/api/drills/$DID/terminals/T1/reports" -H "$ctype" -d '{
   "entries": [
@@ -101,12 +150,22 @@ curl -s -X PUT "$BASE/api/drills/$DID/records/T1/1" -H "$ctype" \
   -d '{"content":"试图更正","reason":"完成后更正"}'; echo
 curl -s -X POST "$BASE/api/drills/$DID/terminals/T1/gaps/lost" -H "$ctype" -d '{"seq":1}'; echo
 curl -s -X POST "$BASE/api/drills/$DID/seals" -H "$ctype" -d '{"note":"x"}'; echo
+curl -s -X POST "$BASE/api/drills/$DID/dependencies" -H "$ctype" -d '{
+  "predecessor": {"terminal_code": "T1", "seq": 3},
+  "successor":   {"terminal_code": "T1", "seq": 1},
+  "reason": "完成后试图变更依赖"
+}'; echo
+curl -s -X DELETE "$BASE/api/drills/$DID/dependencies" -H "$ctype" -d '{
+  "predecessor": {"terminal_code": "T1", "seq": 1},
+  "successor":   {"terminal_code": "T1", "seq": 2}
+}'; echo
 
-echo "## 15. 重复完成 => 同一最终版本（200）；历史读取仍可用"
+echo "## 16. 重复完成 => 同一最终版本（200）；历史读取（含依赖）仍可用"
 curl -s -X POST "$BASE/api/drills/$DID/complete" -H "$ctype" \
   -d '{"note":"再次完成","completed_by":"别人"}'; echo
 curl -s "$BASE/api/drills/$DID/seals"; echo
 curl -s "$BASE/api/drills/$DID/seals/2"; echo
 curl -s "$BASE/api/drills/$DID/timeline"; echo
+curl -s "$BASE/api/drills/$DID/records/T1/3/dependencies"; echo
 
 echo "DONE drill_id=$DID"

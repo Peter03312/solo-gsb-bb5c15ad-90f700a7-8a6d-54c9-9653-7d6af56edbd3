@@ -11,6 +11,8 @@ from .db import connect, init_db
 from .errors import APIError
 from .models import (
     Correction,
+    DependencyCreate,
+    DependencyRevoke,
     DrillComplete,
     DrillCreate,
     MarkLost,
@@ -134,6 +136,44 @@ def correct_record(drill_id: str, terminal_code: str, seq: int, payload: Correct
     data = payload.model_dump()
     data["seq"] = seq
     return service.correct_record(conn, drill_id, terminal_code, seq, data)
+
+
+# ---------------------------------------------------------------- 处置依赖
+
+@app.post("/api/drills/{drill_id}/dependencies")
+def create_dependency(drill_id: str, payload: DependencyCreate, response: Response,
+                      conn=Depends(db)) -> dict:
+    """建立处置依赖（前置 -> 后续，附非空依据）。
+
+    首次建立返回 201；同一对端点且依据一致的重复提交幂等返回 200。
+    """
+    body = service.create_dependency(
+        conn, drill_id, payload.predecessor.model_dump(),
+        payload.successor.model_dump(), payload.reason, payload.created_by,
+    )
+    if not body["already_exists"]:
+        response.status_code = 201
+    return body
+
+
+@app.get("/api/drills/{drill_id}/dependencies")
+def list_dependencies(drill_id: str, conn=Depends(db)) -> dict:
+    return service.list_dependencies(conn, drill_id)
+
+
+@app.delete("/api/drills/{drill_id}/dependencies")
+def revoke_dependency(drill_id: str, payload: DependencyRevoke, conn=Depends(db)) -> dict:
+    """撤销处置依赖（幂等）：依赖不存在时返回 revoked=False。"""
+    return service.revoke_dependency(
+        conn, drill_id, payload.predecessor.model_dump(), payload.successor.model_dump()
+    )
+
+
+@app.get("/api/drills/{drill_id}/records/{terminal_code}/{seq}/dependencies")
+def record_dependencies(drill_id: str, terminal_code: str, seq: int,
+                        conn=Depends(db)) -> dict:
+    """单条记录的依赖视图：直接前置、直接后续、沿前置方向展开的完整链。"""
+    return service.get_record_dependencies(conn, drill_id, terminal_code, seq)
 
 
 # ---------------------------------------------------------------- 封存

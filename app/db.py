@@ -150,10 +150,43 @@ SCHEMA_STATEMENTS = [
         PRIMARY KEY (seal_id, terminal_id, seq)
     )
     """,
+    # 处置依赖：同一演练内两条已上报记录之间的“前置 -> 后续”边（当前视图）。
+    # 端点按 record_id 固化身份（更正不改变记录身份），终端标识与序号为冗余列便于查询与排序
+    """
+    CREATE TABLE IF NOT EXISTS record_dependencies (
+        id                 TEXT PRIMARY KEY,
+        drill_id           TEXT NOT NULL REFERENCES drills(id),
+        pred_record_id     TEXT NOT NULL REFERENCES records(id),
+        succ_record_id     TEXT NOT NULL REFERENCES records(id),
+        pred_terminal_code TEXT NOT NULL,
+        pred_seq           INTEGER NOT NULL,
+        succ_terminal_code TEXT NOT NULL,
+        succ_seq           INTEGER NOT NULL,
+        reason             TEXT NOT NULL,
+        created_by         TEXT,
+        created_at         TEXT NOT NULL,
+        UNIQUE (pred_record_id, succ_record_id)
+    )
+    """,
+    # 封存时点的依赖快照（append-only，含当时依据）
+    """
+    CREATE TABLE IF NOT EXISTS seal_dependencies (
+        seal_id            TEXT NOT NULL REFERENCES seals(id),
+        pred_terminal_code TEXT NOT NULL,
+        pred_seq           INTEGER NOT NULL,
+        succ_terminal_code TEXT NOT NULL,
+        succ_seq           INTEGER NOT NULL,
+        reason             TEXT NOT NULL,
+        created_by         TEXT,
+        created_at         TEXT NOT NULL,
+        PRIMARY KEY (seal_id, pred_terminal_code, pred_seq, succ_terminal_code, succ_seq)
+    )
+    """,
     "CREATE INDEX IF NOT EXISTS idx_records_drill ON records(drill_id)",
     "CREATE INDEX IF NOT EXISTS idx_revisions_record ON record_revisions(record_id)",
     "CREATE INDEX IF NOT EXISTS idx_conflicts_drill ON conflicts(drill_id)",
     "CREATE INDEX IF NOT EXISTS idx_lost_drill ON lost_gaps(drill_id, resolved)",
+    "CREATE INDEX IF NOT EXISTS idx_deps_drill ON record_dependencies(drill_id)",
 ]
 
 

@@ -61,3 +61,22 @@ class DrillComplete(BaseModel):
     # 完成时生成的最终封存版本附注；completed_by 记录演练负责人
     note: Optional[str] = None
     completed_by: Optional[str] = None
+
+
+class DependencyEndpoint(BaseModel):
+    # 宽松类型：非法值由业务层给出明确错误码（invalid_terminal_code / invalid_seq）
+    terminal_code: Any = None
+    seq: Any = None
+
+
+class DependencyCreate(BaseModel):
+    # 前置记录 -> 后续记录；reason 为必填的非空处置依据
+    predecessor: DependencyEndpoint
+    successor: DependencyEndpoint
+    reason: Any = None
+    created_by: Optional[str] = None
+
+
+class DependencyRevoke(BaseModel):
+    predecessor: DependencyEndpoint
+    successor: DependencyEndpoint

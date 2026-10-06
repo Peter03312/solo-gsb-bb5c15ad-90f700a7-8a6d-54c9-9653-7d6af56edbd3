@@ -5,6 +5,8 @@
 **幂等去重**或**冲突存证**，跟踪**缺号**，支持**附理由的更正与原文追溯**，
 并在所有缺号闭合后生成**不可变封存版本**。演练负责人可**主动完成**演练：
 缺号全部闭合时原子生成**最终封存版本**并将演练转为已完成，此后拒绝一切变更。
+现场指挥还可在同一演练内把已上报记录标记为**处置依赖**（前置 → 后续，附非空依据），
+支持幂等建立/撤销、防环校验与单记录依赖链查询；依赖随封存版本一并固化。
 
 - 技术栈：Python 3.11 · FastAPI · SQLite（标准库 `sqlite3`，WAL + 写事务串行化）
 - 无外部服务依赖，Docker 一条命令启动，数据持久化在命名卷中
@@ -79,16 +81,32 @@ compose 中将宿主机 `8080` 映射到容器 `8080`，如需换端口改
 - **迟到补齐**：若缺号先被“确认丢失”后又收到该序号上报，则缺号标记为“已补齐”（filled）。
 - **更正**：必须附**非空理由**；每次更正生成新版本（`rev` 递增），
   原文（`rev=0`）与历次修订长期可查；无实质变化的更正返回 `400 no_change`。
+- **处置依赖**：
+  - 现场指挥可把同一演练内两条**已上报记录**标记为“前置 → 后续”的处置依赖，
+    提交两端记录的**终端标识、序号**及**非空依据**（`reason`）；
+  - 端点必须是**两条不同的现存记录**：缺号、从未上报或仅有冲突证据的序号不能作为端点
+    （`404 record_not_found`）；终端不可跨演练（`404 cross_drill_terminal`）；
+    依赖不得成环（`409 dependency_cycle`）；前置=后续返回 `400 self_dependency`；
+  - **幂等**：同一对端点且依据一致的重复提交返回既有依赖（`already_exists: true`）；
+    同端点不同依据返回 `409 dependency_exists`（先撤销再重建）；重复撤销返回
+    `revoked: false, already_revoked: true`，不报错；
+  - **查询**：单记录视图返回**直接前置、直接后续**及**沿前置方向展开的完整链**
+    （含深度 `depth`），均按**终端标识 + 序号**稳定排序；
+  - **更正不改变依赖所指身份**：依赖按记录身份（record_id）固化，内容修订不影响依赖；
+  - 未完成演练可撤销依赖；**完成后拒绝依赖变更**（`409 drill_completed`），查询照常。
 - **封存**：
   - 条件——所有终端的缺号要么已补齐、要么已逐号确认丢失，否则 `409 unresolved_gaps` 并返回未闭合清单；
-  - 封存生成**只追加（append-only）的不可变快照版本**：封存时刻的时间线、每条记录的全部修订原文、缺号闭合证据；
-  - 封存**不锁死当前时间线**：封存之后迟到上报、更正仍被当前时间线接纳，可再次封存为新版本；
-  - 任何迟到上报/更正/并发提交都**不会改写已封存版本**（封存数据写入独立的快照表，代码路径上不提供更新/删除）。
+  - 封存生成**只追加（append-only）的不可变快照版本**：封存时刻的时间线、每条记录的全部修订原文、
+    缺号闭合证据，以及**当时的处置依赖及依据**（`dependencies`）；
+  - 封存**不锁死当前时间线**：封存之后迟到上报、更正、依赖增删仍被当前视图接纳，可再次封存为新版本；
+  - 任何迟到上报/更正/依赖增删/并发提交都**不会改写已封存版本**（封存数据写入独立的快照表，
+    代码路径上不提供更新/删除）。
 - **完成（主动收官）**：
   - 演练负责人调用 `POST /api/drills/{id}/complete` 主动完成演练；
   - 仅当所有缺号已闭合（补齐或逐号确认丢失）时，**同一事务内原子**生成最终不可变封存版本并把演练置为
     `completed`；条件不满足返回 `409 unresolved_gaps`（附未闭合缺号清单），**不生成任何封存版本**；
-  - 完成后拒绝一切变更：终端登记、非重复上报、更正、缺号确认、再次封存均返回 `409 drill_completed`；
+  - 完成后拒绝一切变更：终端登记、非重复上报、更正、缺号确认、依赖建立/撤销、再次封存
+    均返回 `409 drill_completed`；
   - 完成后的上报重试：**相同内容仍返回 `duplicate`**（幂等不变）；**冲突内容直接拒绝且不新增冲突证据**；
   - 时间线、缺号、冲突、记录、封存版本等**历史读取不受影响**；
   - **重复完成幂等**：返回同一最终版本（`already_completed: true`），不产生新版本。
@@ -116,6 +134,10 @@ compose 中将宿主机 `8080` 映射到容器 `8080`，如需换端口改
 | GET | `/api/drills/{drill_id}/conflicts` | 冲突证据列表 |
 | GET | `/api/drills/{drill_id}/records/{terminal_code}/{seq}` | 单条记录 + 全部修订 |
 | PUT | `/api/drills/{drill_id}/records/{terminal_code}/{seq}` | **附理由更正** |
+| POST | `/api/drills/{drill_id}/dependencies` | **建立处置依赖**（前置→后续+非空依据，幂等） |
+| GET | `/api/drills/{drill_id}/dependencies` | 当前依赖列表（按前置终端+序号→后续终端+序号排序） |
+| DELETE | `/api/drills/{drill_id}/dependencies` | **撤销处置依赖**（幂等） |
+| GET | `/api/drills/{drill_id}/records/{terminal_code}/{seq}/dependencies` | 单记录依赖视图：直接前置/后续 + 前置完整链 |
 | POST | `/api/drills/{drill_id}/seals` | 封存（缺号未闭合返回 409） |
 | GET | `/api/drills/{drill_id}/seals` | 封存版本列表（含 `is_final` 标记） |
 | GET | `/api/drills/{drill_id}/seals/{version}` | 取指定不可变封存版本 |
@@ -162,8 +184,38 @@ compose 中将宿主机 `8080` 映射到容器 `8080`，如需换端口改
 **确认丢失** `POST .../gaps/lost`：`{"seq": 1, "reason": "缓存损坏", "confirmed_by": "保障组"}`
 （重复确认幂等；确认一个不存在的缺号或已上报序号返回 `409`）。
 
+**建立处置依赖** `POST /api/drills/{id}/dependencies`
+
+```json
+{"predecessor": {"terminal_code": "T1", "seq": 1},
+ "successor":   {"terminal_code": "T1", "seq": 2},
+ "reason": "终端上线自检通过后，水位数据方可采信",
+ "created_by": "现场指挥"}
+```
+
+首次建立返回 `201`；同一对端点且依据一致的重复提交幂等返回 `200` 与同一依赖
+（`already_exists: true`）。撤销用 `DELETE` 同路径、正文只含 `predecessor`/`successor`，
+返回 `{"revoked": true}`；重复撤销返回 `{"revoked": false, "already_revoked": true}`。
+
+**单记录依赖视图** `GET /api/drills/{id}/records/T1/3/dependencies`
+
+```json
+{
+  "drill_id": "drill_...", "record_id": "rec_...", "terminal_code": "T1", "seq": 3,
+  "predecessors": [{"terminal_code": "T1", "seq": 2, "record_id": "rec_...",
+                    "dependency_id": "dep_...", "reason": "..."}],
+  "successors": [],
+  "predecessor_chain": [{"terminal_code": "T1", "seq": 1, "record_id": "rec_...", "depth": 2},
+                        {"terminal_code": "T1", "seq": 2, "record_id": "rec_...", "depth": 1}]
+}
+```
+
+`predecessors`/`successors` 为直接前置/后续（含依据），`predecessor_chain` 为沿前置方向
+展开的完整链（`depth` 为最小跳数），三者均按终端标识 + 序号稳定排序。
+
 **封存** `POST /api/drills/{id}/seals`：成功返回版本快照（`version`、`records` 含各自全部
-`revisions`、`closed_gaps` 含 `filled`/`lost` 闭合证据，`immutable: true`）。
+`revisions`、`closed_gaps` 含 `filled`/`lost` 闭合证据、`dependencies` 含当时的处置依赖及依据，
+`immutable: true`）。
 
 **完成** `POST /api/drills/{id}/complete`
 
@@ -203,6 +255,11 @@ compose 中将宿主机 `8080` 映射到容器 `8080`，如需换端口改
 | 同序号内容冲突 | 200 体 `conflict` | 冲突证据落库 `conflicts` |
 | 跨演练更正（记录不在该演练） | 404 | `record_not_found`（终端层面先报 `cross_drill_terminal`） |
 | 更正无理由 / 无变化 | 400 | `invalid_reason` / `no_change` |
+| 依赖依据为空 | 400 | `invalid_reason` |
+| 依赖前置与后续为同一条记录 | 400 | `self_dependency` |
+| 依赖端点不存在（缺号 / 仅有冲突证据 / 未上报） | 404 | `record_not_found` |
+| 同端点对已存在不同依据的依赖 | 409 | `dependency_exists` |
+| 依赖会与前序依赖成环 | 409 | `dependency_cycle` |
 | 缺号未闭合就封存/完成 | 409 | `unresolved_gaps`（details 带缺号清单） |
 | 对非缺号确认丢失 / 缺号超范围 | 409 | `gap_already_filled` / `not_a_gap` |
 | 封存版本不存在 | 404 | `seal_version_not_found` |
@@ -211,8 +268,8 @@ compose 中将宿主机 `8080` 映射到容器 `8080`，如需换端口改
 
 ## 6. 调用示例
 
-- 纯标准库 Python，全流程（登记→上报→幂等→冲突→缺号→更正→封存被拒→闭合→封存→封存后迟到
-  →完成被拒→闭合→完成→完成后拒绝语义→重复完成幂等）：
+- 纯标准库 Python，全流程（登记→上报→幂等→冲突→缺号→更正→处置依赖→封存被拒→闭合→
+  封存→封存后迟到与依赖增删→完成被拒→闭合→完成→完成后拒绝语义→重复完成幂等）：
 
   ```bash
   pip install httpx   # 仅测试需要；demo_api.py 只用标准库
@@ -239,8 +296,14 @@ python -m pytest -q
 封存后当前时间线继续接纳变更、跨演练更正被拒；主动完成——缺号未闭合拒绝且不生成版本、
 原子生成最终版本并转为已完成、完成后拒绝登记/非重复上报/更正/缺号确认/再封存、
 相同内容重试仍 `duplicate`、冲突内容不新增证据、历史读取可用、重复完成返回同一版本；
+处置依赖——建立与幂等重复提交、同端点不同依据拒绝、撤销与幂等重复撤销、
+空依据/非法序号/空终端标识/自我依赖/缺号与无记录端点/未登记与跨演练终端校验、
+直接与间接成环拒绝及撤销后重建、单记录直接前置/后续与前置完整链的稳定排序、
+更正后依赖身份不变、封存快照固化依赖且后续增删不影响历史版本、
+完成时依赖随最终版本原子固化、完成后依赖变更被拒而查询照常；
 以及 20 线程并发下**同序号相同内容恰有 1 条 accepted/19 条 duplicate**、
-**不同内容恰有 1 条 accepted/19 份冲突证据**、**并发完成恰好生成 1 个最终版本**。
+**不同内容恰有 1 条 accepted/19 份冲突证据**、**并发完成恰好生成 1 个最终版本**、
+**并发建立同一依赖恰有 1 条新建/其余幂等命中**。
 
 ## 8. 并发与数据完整性设计
 
@@ -248,9 +311,14 @@ python -m pytest -q
   `busy_timeout` 保证高并发下排队而不是立即失败。完成操作的“缺号校验 + 最终版本快照 +
   状态翻转”在同一事务内原子生效，并发完成恰好生成一个最终版本。
 - 唯一约束兜底：`terminals(drill_id, code)`、`records(terminal_id, seq)`、
-  `lost_gaps(terminal_id, seq)`、`seals(drill_id, version)`。
-- 封存数据写入 `seals / seal_records / seal_revisions / seal_gaps` 独立快照表，仅追加；
-  服务不提供任何更新/删除快照的代码路径，迟到上报与更正只作用于当前时间线表。
+  `lost_gaps(terminal_id, seq)`、`seals(drill_id, version)`、
+  `record_dependencies(pred_record_id, succ_record_id)`。
+- 封存数据写入 `seals / seal_records / seal_revisions / seal_gaps / seal_dependencies`
+  独立快照表，仅追加；服务不提供任何更新/删除快照的代码路径，
+  迟到上报、更正与依赖增删只作用于当前时间线表。
+- 处置依赖的环检测与建立在同一 `BEGIN IMMEDIATE` 事务内完成：先沿前置方向做 BFS
+  确认“后续记录”不在“前置记录”的祖先集合中再插边，并发提交被写锁串行化，
+  不会写出成环或重复的依赖。
 - 演练完成后（`drills.status = completed`）所有变更入口在事务内先行拒绝；
   最终封存版本号固化在 `drills.final_seal_version`，重复完成直接读取并返回同一版本。
 - 时间统一规范化为 UTC ISO-8601（微秒精度），既保证幂等指纹稳定，也保证字符串排序即时间排序。
