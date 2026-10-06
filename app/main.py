@@ -11,6 +11,8 @@ from .db import connect, init_db
 from .errors import APIError
 from .models import (
     Correction,
+    DependencyCreate,
+    DependencyRevoke,
     DrillComplete,
     DrillCreate,
     MarkLost,
@@ -134,6 +136,43 @@ def correct_record(drill_id: str, terminal_code: str, seq: int, payload: Correct
     data = payload.model_dump()
     data["seq"] = seq
     return service.correct_record(conn, drill_id, terminal_code, seq, data)
+
+
+# ---------------------------------------------------------------- 处置依赖
+
+@app.put("/api/drills/{drill_id}/dependencies")
+def create_dependency(drill_id: str, payload: DependencyCreate,
+                      response: Response, conn=Depends(db)) -> dict:
+    """标记处置依赖：successor（后续）的处置依赖于 predecessor（前置）。
+
+    首次建立返回 201；重复提交同一条边幂等返回 200 与首次依据。
+    """
+    result = service.create_dependency(
+        conn, drill_id,
+        payload.predecessor.model_dump(),
+        payload.successor.model_dump(),
+        payload.basis,
+    )
+    if not result["already_exists"]:
+        response.status_code = 201
+    return result
+
+
+@app.delete("/api/drills/{drill_id}/dependencies")
+def revoke_dependency(drill_id: str, payload: DependencyRevoke, conn=Depends(db)) -> dict:
+    """撤销处置依赖（演练未完成时）。重复撤销幂等：边不存在返回 deleted=false。"""
+    return service.revoke_dependency(
+        conn, drill_id,
+        payload.predecessor.model_dump(),
+        payload.successor.model_dump(),
+    )
+
+
+@app.get("/api/drills/{drill_id}/records/{terminal_code}/{seq}/dependencies")
+def record_dependencies(drill_id: str, terminal_code: str, seq: int,
+                        conn=Depends(db)) -> dict:
+    """查询记录的直接前置、直接后续及沿前置方向展开的完整链。"""
+    return service.get_dependencies(conn, drill_id, terminal_code, seq)
 
 
 # ---------------------------------------------------------------- 封存

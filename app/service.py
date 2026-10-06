@@ -409,6 +409,9 @@ def get_drill_status(conn: sqlite3.Connection, drill_id: str) -> dict:
         seal_rows = conn.execute(
             "SELECT * FROM seals WHERE drill_id = ? ORDER BY version", (drill_id,)
         ).fetchall()
+        dep_count = conn.execute(
+            "SELECT COUNT(*) AS c FROM dependencies WHERE drill_id = ?", (drill_id,)
+        ).fetchone()["c"]
     open_gaps = [g for g in gaps if g["state"] == "missing"]
     return {
         "drill": _drill_dict(drill),
@@ -416,6 +419,7 @@ def get_drill_status(conn: sqlite3.Connection, drill_id: str) -> dict:
         "record_count": len(rows),
         "open_gap_count": len(open_gaps),
         "open_gaps": open_gaps,
+        "dependency_count": dep_count,
         "sealed": len(seal_rows) > 0,
         "seal_versions": [s["version"] for s in seal_rows],
     }
@@ -623,6 +627,331 @@ def list_conflicts(conn: sqlite3.Connection, drill_id: str) -> dict:
     }
 
 
+# ---------------------------------------------------------------- 处置依赖
+
+def _resolve_dependency_endpoint(conn: sqlite3.Connection, drill_id: str,
+                                 endpoint: Any, label: str) -> sqlite3.Row:
+    """把 {terminal_code, seq} 解析为本演练内的现存记录。
+
+    只有现存记录能作为依赖端点：缺号无记录；同终端同序号内容冲突时，
+    系统只留存首报记录与冲突证据，冲突证据本身不是记录，同样不能作为端点。
+    """
+    if not isinstance(endpoint, dict):
+        raise APIError(f"{label} 必须是包含 terminal_code 与 seq 的对象",
+                       code="invalid_dependency_endpoint")
+    code = endpoint.get("terminal_code")
+    if not isinstance(code, str) or not code.strip():
+        raise APIError(f"{label} 的终端标识 terminal_code 必须是非空字符串",
+                       code="invalid_terminal_code")
+    code = code.strip()
+    seq = _validate_seq(endpoint.get("seq"))
+    terminal = _require_terminal(conn, drill_id, code)
+    row = conn.execute(
+        "SELECT r.*, t.code AS terminal_code FROM records r "
+        "JOIN terminals t ON t.id = r.terminal_id "
+        "WHERE r.drill_id = ? AND r.terminal_id = ? AND r.seq = ?",
+        (drill_id, terminal["id"], seq),
+    ).fetchone()
+    if row is None:
+        # 区分缺号与“仅有冲突证据”两种情况，给出可操作的提示
+        gap = conn.execute(
+            "SELECT 1 FROM lost_gaps WHERE terminal_id = ? AND seq = ?",
+            (terminal["id"], seq),
+        ).fetchone()
+        if gap is not None:
+            hint = "该序号是缺号（已确认丢失），缺号不能作为处置依赖端点"
+        else:
+            conflict = conn.execute(
+                "SELECT 1 FROM conflicts WHERE terminal_id = ? AND seq = ? LIMIT 1",
+                (terminal["id"], seq),
+            ).fetchone()
+            if conflict is not None:
+                hint = ("该序号只有冲突上报证据、没有现存记录，"
+                        "冲突证据不能作为处置依赖端点")
+            else:
+                hint = "该序号尚未上报，缺号不能作为处置依赖端点"
+        raise NotFoundError(
+            f"{label} 终端 {code} 序号 {seq} 不存在现存记录：{hint}",
+            code="endpoint_record_not_found",
+        )
+    return row
+
+
+def _dependency_ref(row: sqlite3.Row) -> dict:
+    """依赖边在响应中的对外表示（以终端标识+序号标识端点身份）。"""
+    return {
+        "dependency_id": row["id"],
+        "predecessor": {
+            "record_id": row["predecessor_record_id"],
+            "terminal_code": row["pre_terminal_code"],
+            "seq": row["pre_seq"],
+        },
+        "successor": {
+            "record_id": row["successor_record_id"],
+            "terminal_code": row["succ_terminal_code"],
+            "seq": row["succ_seq"],
+        },
+        "basis": row["basis"],
+        "created_at": row["created_at"],
+    }
+
+
+def _get_dependency_edge(conn: sqlite3.Connection, predecessor_id: str,
+                         successor_id: str) -> Optional[sqlite3.Row]:
+    return conn.execute(
+        "SELECT d.*, "
+        "tp.code AS pre_terminal_code, rp.seq AS pre_seq, "
+        "ts.code AS succ_terminal_code, rs.seq AS succ_seq "
+        "FROM dependencies d "
+        "JOIN records rp ON rp.id = d.predecessor_record_id "
+        "JOIN terminals tp ON tp.id = rp.terminal_id "
+        "JOIN records rs ON rs.id = d.successor_record_id "
+        "JOIN terminals ts ON ts.id = rs.terminal_id "
+        "WHERE d.predecessor_record_id = ? AND d.successor_record_id = ?",
+        (predecessor_id, successor_id),
+    ).fetchone()
+
+
+def _successor_path(conn: sqlite3.Connection, drill_id: str, start_id: str,
+                    target_id: str) -> Optional[list[sqlite3.Row]]:
+    """在本演练的依赖图内，沿“前置 -> 后续”方向查找 start 到 target 的一条路径。
+
+    若存在则返回路径上的边列表（含 start==target 的空路径），不存在返回 None。
+    用于提交 predecessor -> successor 前的环检测：
+    若 successor 已能沿边到达 predecessor，再加边就会成环。
+    """
+    if start_id == target_id:
+        return []
+    edges = conn.execute(
+        "SELECT d.*, "
+        "tp.code AS pre_terminal_code, rp.seq AS pre_seq, "
+        "ts.code AS succ_terminal_code, rs.seq AS succ_seq "
+        "FROM dependencies d "
+        "JOIN records rp ON rp.id = d.predecessor_record_id "
+        "JOIN terminals tp ON tp.id = rp.terminal_id "
+        "JOIN records rs ON rs.id = d.successor_record_id "
+        "JOIN terminals ts ON ts.id = rs.terminal_id "
+        "WHERE d.drill_id = ?",
+        (drill_id,),
+    ).fetchall()
+    adjacency: dict[str, list[sqlite3.Row]] = {}
+    for e in edges:
+        adjacency.setdefault(e["predecessor_record_id"], []).append(e)
+    queue: list[str] = [start_id]
+    parents: dict[str, tuple[str, sqlite3.Row]] = {}
+    seen = {start_id}
+    head = 0
+    while head < len(queue):
+        cur = queue[head]
+        head += 1
+        for edge in adjacency.get(cur, []):
+            nxt = edge["successor_record_id"]
+            if nxt in seen:
+                continue
+            seen.add(nxt)
+            parents[nxt] = (cur, edge)
+            if nxt == target_id:
+                # 回溯路径
+                path: list[sqlite3.Row] = []
+                node = nxt
+                while node != start_id:
+                    prev, pe = parents[node]
+                    path.append(pe)
+                    node = prev
+                path.reverse()
+                return path
+            queue.append(nxt)
+    return None
+
+
+def create_dependency(conn: sqlite3.Connection, drill_id: str,
+                      predecessor: dict, successor: dict, basis: Any) -> dict:
+    """标记一条处置依赖：successor（后续）的处置依赖 predecessor（前置）。
+
+    幂等：同一条边重复提交直接返回既有边（保留首次依据），不新增数据。
+    """
+    if not isinstance(basis, str) or not basis.strip():
+        raise APIError("处置依据 basis 必须是非空字符串", code="invalid_basis")
+    basis = basis.strip()
+
+    with transaction(conn):
+        _require_drill_open(conn, drill_id)
+        pre = _resolve_dependency_endpoint(conn, drill_id, predecessor, "前置记录")
+        succ = _resolve_dependency_endpoint(conn, drill_id, successor, "后续记录")
+        if pre["id"] == succ["id"]:
+            raise ConflictError(
+                "前置记录与后续记录必须是两条不同的现存记录，不能对自身建立依赖",
+                code="self_dependency",
+            )
+
+        existing = _get_dependency_edge(conn, pre["id"], succ["id"])
+        already_exists = existing is not None
+        if existing is None:
+            # 环检测：若后续记录已能沿“前置->后续”方向到达前置记录，则成环
+            path = _successor_path(conn, drill_id, succ["id"], pre["id"])
+            if path is not None:
+                chain = [f"{e['succ_terminal_code']}#{e['succ_seq']}" for e in path]
+                raise ConflictError(
+                    "该依赖会形成环：后续记录 "
+                    f"{succ['terminal_code']}#{succ['seq']} 已（直接或间接）依赖于前置记录 "
+                    f"{pre['terminal_code']}#{pre['seq']}"
+                    + (f"（现有路径：{' -> '.join(chain)}）" if chain else ""),
+                    code="dependency_cycle",
+                    details={
+                        "existing_path": [
+                            {"terminal_code": e["succ_terminal_code"], "seq": e["succ_seq"]}
+                            for e in path
+                        ],
+                    },
+                )
+            dep_id = _new_id("dep")
+            conn.execute(
+                "INSERT INTO dependencies (id, drill_id, predecessor_record_id, "
+                "successor_record_id, basis, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                (dep_id, drill_id, pre["id"], succ["id"], basis, now_iso()),
+            )
+            existing = _get_dependency_edge(conn, pre["id"], succ["id"])
+
+    body = _dependency_ref(existing)
+    body["drill_id"] = drill_id
+    body["already_exists"] = already_exists
+    return body
+
+
+def revoke_dependency(conn: sqlite3.Connection, drill_id: str,
+                      predecessor: dict, successor: dict) -> dict:
+    """撤销一条处置依赖。幂等：边不存在时 deleted=false，不报错。"""
+    with transaction(conn):
+        _require_drill_open(conn, drill_id)
+        pre = _resolve_dependency_endpoint(conn, drill_id, predecessor, "前置记录")
+        succ = _resolve_dependency_endpoint(conn, drill_id, successor, "后续记录")
+        existing = _get_dependency_edge(conn, pre["id"], succ["id"])
+        if existing is None:
+            deleted = False
+            basis = None
+            created_at = None
+        else:
+            conn.execute("DELETE FROM dependencies WHERE id = ?", (existing["id"],))
+            deleted = True
+            basis = existing["basis"]
+            created_at = existing["created_at"]
+
+    return {
+        "drill_id": drill_id,
+        "deleted": deleted,
+        "predecessor": {"terminal_code": pre["terminal_code"], "seq": pre["seq"]},
+        "successor": {"terminal_code": succ["terminal_code"], "seq": succ["seq"]},
+        "basis": basis,
+        "created_at": created_at,
+    }
+
+
+def _neighbor_record_dict(row: sqlite3.Row) -> dict:
+    """依赖邻居（直接前置/直接后续）的记录表示，附带所属依赖边信息。"""
+    body = _record_dict(row)
+    body["dependency"] = {
+        "dependency_id": row["dep_id"],
+        "basis": row["dep_basis"],
+        "created_at": row["dep_created_at"],
+    }
+    return body
+
+
+def _predecessor_chain(conn: sqlite3.Connection, drill_id: str,
+                       record_id: str) -> list[dict]:
+    """沿前置方向展开完整链：返回全部（直接与间接）前置记录。
+
+    无环图下每个祖先只出现一次，distance 为沿边到达该祖先的最短条数
+    （直接前置 distance=1）；结果按终端标识、序号稳定排序。
+    """
+    edges = conn.execute(
+        "SELECT predecessor_record_id, successor_record_id FROM dependencies "
+        "WHERE drill_id = ?",
+        (drill_id,),
+    ).fetchall()
+    preds: dict[str, list[str]] = {}
+    for e in edges:
+        preds.setdefault(e["successor_record_id"], []).append(e["predecessor_record_id"])
+
+    distance = {record_id: 0}
+    queue = [record_id]
+    head = 0
+    while head < len(queue):
+        cur = queue[head]
+        head += 1
+        for pid in preds.get(cur, []):
+            nd = distance[cur] + 1
+            if pid not in distance or nd < distance[pid]:
+                distance[pid] = nd
+                queue.append(pid)
+
+    ancestor_ids = [rid for rid in distance if rid != record_id]
+    if not ancestor_ids:
+        return []
+    marks = ",".join("?" for _ in ancestor_ids)
+    rows = conn.execute(
+        f"SELECT r.*, t.code AS terminal_code FROM records r "
+        f"JOIN terminals t ON t.id = r.terminal_id WHERE r.id IN ({marks})",
+        ancestor_ids,
+    ).fetchall()
+    chain = []
+    for r in rows:
+        item = _record_dict(r)
+        item["distance"] = distance[r["id"]]
+        chain.append(item)
+    chain.sort(key=lambda x: (x["terminal_code"], x["seq"]))
+    return chain
+
+
+def get_dependencies(conn: sqlite3.Connection, drill_id: str,
+                     terminal_code: str, seq: Any) -> dict:
+    """查询指定记录的处置依赖：直接前置、直接后续与沿前置方向的完整链。"""
+    with transaction(conn, immediate=False):
+        _require_drill(conn, drill_id)
+        terminal = _require_terminal(conn, drill_id, terminal_code)
+        seq = _validate_seq(seq)
+        record = conn.execute(
+            "SELECT r.*, t.code AS terminal_code FROM records r "
+            "JOIN terminals t ON t.id = r.terminal_id "
+            "WHERE r.drill_id = ? AND r.terminal_id = ? AND r.seq = ?",
+            (drill_id, terminal["id"], seq),
+        ).fetchone()
+        if record is None:
+            raise NotFoundError(
+                f"终端 {terminal_code} 序号 {seq} 的记录不存在，无法查询依赖",
+                code="record_not_found",
+            )
+        pre_rows = conn.execute(
+            "SELECT r.*, t.code AS terminal_code, "
+            "d.id AS dep_id, d.basis AS dep_basis, d.created_at AS dep_created_at "
+            "FROM dependencies d "
+            "JOIN records r ON r.id = d.predecessor_record_id "
+            "JOIN terminals t ON t.id = r.terminal_id "
+            "WHERE d.successor_record_id = ? "
+            "ORDER BY t.code ASC, r.seq ASC",
+            (record["id"],),
+        ).fetchall()
+        succ_rows = conn.execute(
+            "SELECT r.*, t.code AS terminal_code, "
+            "d.id AS dep_id, d.basis AS dep_basis, d.created_at AS dep_created_at "
+            "FROM dependencies d "
+            "JOIN records r ON r.id = d.successor_record_id "
+            "JOIN terminals t ON t.id = r.terminal_id "
+            "WHERE d.predecessor_record_id = ? "
+            "ORDER BY t.code ASC, r.seq ASC",
+            (record["id"],),
+        ).fetchall()
+        chain = _predecessor_chain(conn, drill_id, record["id"])
+
+    return {
+        "drill_id": drill_id,
+        "record": _record_dict(record),
+        "direct_predecessors": [_neighbor_record_dict(r) for r in pre_rows],
+        "direct_successors": [_neighbor_record_dict(r) for r in succ_rows],
+        "predecessor_chain": chain,
+    }
+
+
 # ---------------------------------------------------------------- 封存
 
 def _create_seal_snapshot(conn: sqlite3.Connection, drill_id: str,
@@ -677,6 +1006,31 @@ def _create_seal_snapshot(conn: sqlite3.Connection, drill_id: str,
             "VALUES (?, ?, ?, ?, ?)",
             (seal_id, g["terminal_id"], g["terminal_code"], g["seq"],
              "filled" if g["resolved"] else "lost"),
+        )
+    # 处置依赖快照：封存当时的每条依赖边及其非空依据（身份以记录主键固化）
+    dep_rows = conn.execute(
+        "SELECT d.*, "
+        "rp.terminal_id AS pre_terminal_id, tp.code AS pre_terminal_code, rp.seq AS pre_seq, "
+        "rs.terminal_id AS succ_terminal_id, ts.code AS succ_terminal_code, rs.seq AS succ_seq "
+        "FROM dependencies d "
+        "JOIN records rp ON rp.id = d.predecessor_record_id "
+        "JOIN terminals tp ON tp.id = rp.terminal_id "
+        "JOIN records rs ON rs.id = d.successor_record_id "
+        "JOIN terminals ts ON ts.id = rs.terminal_id "
+        "WHERE d.drill_id = ? "
+        "ORDER BY tp.code, rp.seq, ts.code, rs.seq",
+        (drill_id,),
+    ).fetchall()
+    for d in dep_rows:
+        conn.execute(
+            "INSERT INTO seal_dependencies (seal_id, dependency_id, predecessor_record_id, "
+            "successor_record_id, predecessor_terminal_id, predecessor_terminal_code, "
+            "predecessor_seq, successor_terminal_id, successor_terminal_code, successor_seq, "
+            "basis, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (seal_id, d["id"], d["predecessor_record_id"], d["successor_record_id"],
+             d["pre_terminal_id"], d["pre_terminal_code"], d["pre_seq"],
+             d["succ_terminal_id"], d["succ_terminal_code"], d["succ_seq"],
+             d["basis"], d["created_at"]),
         )
     return version
 
@@ -750,12 +1104,16 @@ def list_seals(conn: sqlite3.Connection, drill_id: str) -> dict:
             cnt = conn.execute(
                 "SELECT COUNT(*) AS c FROM seal_records WHERE seal_id = ?", (s["id"],)
             ).fetchone()["c"]
+            dep_cnt = conn.execute(
+                "SELECT COUNT(*) AS c FROM seal_dependencies WHERE seal_id = ?", (s["id"],)
+            ).fetchone()["c"]
             out.append({
                 "seal_id": s["id"],
                 "version": s["version"],
                 "note": s["note"],
                 "created_at": s["created_at"],
                 "record_count": cnt,
+                "dependency_count": dep_cnt,
                 "is_final": drill["final_seal_version"] == s["version"],
             })
     return {"drill_id": drill_id, "seals": out}
@@ -787,6 +1145,12 @@ def get_seal(conn: sqlite3.Connection, drill_id: str, version: int) -> dict:
         ).fetchall()
         gap_rows = conn.execute(
             "SELECT * FROM seal_gaps WHERE seal_id = ? ORDER BY terminal_code, seq",
+            (seal["id"],),
+        ).fetchall()
+        dep_rows = conn.execute(
+            "SELECT * FROM seal_dependencies WHERE seal_id = ? "
+            "ORDER BY predecessor_terminal_code, predecessor_seq, "
+            "successor_terminal_code, successor_seq",
             (seal["id"],),
         ).fetchall()
 
@@ -832,5 +1196,23 @@ def get_seal(conn: sqlite3.Connection, drill_id: str, version: int) -> dict:
                 "closed_by": g["closed_by"],
             }
             for g in gap_rows
+        ],
+        "dependencies": [
+            {
+                "dependency_id": d["dependency_id"],
+                "predecessor": {
+                    "record_id": d["predecessor_record_id"],
+                    "terminal_code": d["predecessor_terminal_code"],
+                    "seq": d["predecessor_seq"],
+                },
+                "successor": {
+                    "record_id": d["successor_record_id"],
+                    "terminal_code": d["successor_terminal_code"],
+                    "seq": d["successor_seq"],
+                },
+                "basis": d["basis"],
+                "created_at": d["created_at"],
+            }
+            for d in dep_rows
         ],
     }

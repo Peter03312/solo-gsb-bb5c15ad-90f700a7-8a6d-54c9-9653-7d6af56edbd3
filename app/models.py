@@ -57,6 +57,26 @@ class SealCreate(BaseModel):
     note: Optional[str] = None
 
 
+# 依赖端点：终端标识 + 序号共同定位一条现存记录
+class DependencyEndpoint(BaseModel):
+    terminal_code: Any = None
+    seq: Any = None
+
+
+class DependencyCreate(BaseModel):
+    # 前置记录（被依赖方）：其处置完成是后续记录处置的前提
+    predecessor: DependencyEndpoint
+    # 后续记录（依赖方）
+    successor: DependencyEndpoint
+    # 非空处置依据
+    basis: Any = None
+
+
+class DependencyRevoke(BaseModel):
+    predecessor: DependencyEndpoint
+    successor: DependencyEndpoint
+
+
 class DrillComplete(BaseModel):
     # 完成时生成的最终封存版本附注；completed_by 记录演练负责人
     note: Optional[str] = None

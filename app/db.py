@@ -97,6 +97,21 @@ SCHEMA_STATEMENTS = [
         UNIQUE (terminal_id, seq)
     )
     """,
+    # 处置依赖：successor_record_id 的处置依赖于 predecessor_record_id，
+    # 即一条“后续记录 -> 前置记录”的有向边；依赖关系本身是一个无环图（DAG）。
+    # 边以记录主键为端点，因此更正（原地更新 records）不改变依赖所指身份。
+    """
+    CREATE TABLE IF NOT EXISTS dependencies (
+        id                    TEXT PRIMARY KEY,
+        drill_id              TEXT NOT NULL REFERENCES drills(id),
+        predecessor_record_id TEXT NOT NULL REFERENCES records(id),
+        successor_record_id   TEXT NOT NULL REFERENCES records(id),
+        basis                 TEXT NOT NULL,
+        created_at            TEXT NOT NULL,
+        UNIQUE (predecessor_record_id, successor_record_id),
+        CHECK (predecessor_record_id != successor_record_id)
+    )
+    """,
     # 封存版本（append-only；表本身只追加不改写）
     """
     CREATE TABLE IF NOT EXISTS seals (
@@ -150,10 +165,31 @@ SCHEMA_STATEMENTS = [
         PRIMARY KEY (seal_id, terminal_id, seq)
     )
     """,
+    # 封存时点的处置依赖快照（含每条边的非空依据；端点身份以记录主键固化）
+    """
+    CREATE TABLE IF NOT EXISTS seal_dependencies (
+        seal_id                    TEXT NOT NULL REFERENCES seals(id),
+        dependency_id              TEXT NOT NULL,
+        predecessor_record_id      TEXT NOT NULL,
+        successor_record_id        TEXT NOT NULL,
+        predecessor_terminal_id    TEXT NOT NULL,
+        predecessor_terminal_code  TEXT NOT NULL,
+        predecessor_seq            INTEGER NOT NULL,
+        successor_terminal_id      TEXT NOT NULL,
+        successor_terminal_code    TEXT NOT NULL,
+        successor_seq              INTEGER NOT NULL,
+        basis                      TEXT NOT NULL,
+        created_at                 TEXT NOT NULL,
+        PRIMARY KEY (seal_id, dependency_id)
+    )
+    """,
     "CREATE INDEX IF NOT EXISTS idx_records_drill ON records(drill_id)",
     "CREATE INDEX IF NOT EXISTS idx_revisions_record ON record_revisions(record_id)",
     "CREATE INDEX IF NOT EXISTS idx_conflicts_drill ON conflicts(drill_id)",
     "CREATE INDEX IF NOT EXISTS idx_lost_drill ON lost_gaps(drill_id, resolved)",
+    "CREATE INDEX IF NOT EXISTS idx_dependencies_drill ON dependencies(drill_id)",
+    "CREATE INDEX IF NOT EXISTS idx_dependencies_pred ON dependencies(predecessor_record_id)",
+    "CREATE INDEX IF NOT EXISTS idx_dependencies_succ ON dependencies(successor_record_id)",
 ]
 
 

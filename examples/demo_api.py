@@ -109,41 +109,90 @@ def main() -> None:
     show("时间线", call("GET", f"/api/drills/{drill_id}/timeline"))
     show("缺号", call("GET", f"/api/drills/{drill_id}/gaps"))
 
-    # 6. 更正（附理由），原文与历次修订可查询
-    step("6. 带理由更正 T1#3")
+    # 5b. 处置依赖：把已上报记录标记为“后续处置依赖前置”（同演练、非空依据、幂等）
+    step("5b. 标记处置依赖（前置 T1#1 -> 后续 T1#3；首次 201）")
+    show("建立依赖", call("PUT", f"/api/drills/{drill_id}/dependencies", {
+        "predecessor": {"terminal_code": "T1", "seq": 1},
+        "successor": {"terminal_code": "T1", "seq": 3},
+        "basis": "T1#3 的处置以 T1#1 的现场确认为前提",
+    }))
+    show("重复提交 => 幂等（200，already_exists=true，保留首次依据）",
+         call("PUT", f"/api/drills/{drill_id}/dependencies", {
+             "predecessor": {"terminal_code": "T1", "seq": 1},
+             "successor": {"terminal_code": "T1", "seq": 3},
+             "basis": "重复提交的另一个依据（不会覆盖）",
+         }))
+    show("再建一条：T1#2 -> T2#2（跨终端、同演练）",
+         call("PUT", f"/api/drills/{drill_id}/dependencies", {
+             "predecessor": {"terminal_code": "T1", "seq": 2},
+             "successor": {"terminal_code": "T2", "seq": 2},
+             "basis": "T2#2 的处置等待 T1#2 的水位复核",
+         }))
+    show("成环被拒（T1#1 反过来依赖 T1#3 => 409 dependency_cycle）",
+         call("PUT", f"/api/drills/{drill_id}/dependencies", {
+             "predecessor": {"terminal_code": "T1", "seq": 3},
+             "successor": {"terminal_code": "T1", "seq": 1},
+             "basis": "试图制造环",
+         }))
+    show("缺号不能作为端点（T2#1 是未闭合缺号 => 404 endpoint_record_not_found）",
+         call("PUT", f"/api/drills/{drill_id}/dependencies", {
+             "predecessor": {"terminal_code": "T2", "seq": 1},
+             "successor": {"terminal_code": "T1", "seq": 3},
+             "basis": "缺号当前置",
+         }))
+    show("查询 T1#3 的依赖（直接前置/直接后续/沿前置方向完整链，稳定排序）",
+         call("GET", f"/api/drills/{drill_id}/records/T1/3/dependencies"))
+    show("撤销依赖（演练未完成可撤销）",
+         call("DELETE", f"/api/drills/{drill_id}/dependencies", {
+             "predecessor": {"terminal_code": "T1", "seq": 2},
+             "successor": {"terminal_code": "T2", "seq": 2},
+         }))
+    show("重复撤销 => 幂等（deleted=false）",
+         call("DELETE", f"/api/drills/{drill_id}/dependencies", {
+             "predecessor": {"terminal_code": "T1", "seq": 2},
+             "successor": {"terminal_code": "T2", "seq": 2},
+         }))
+
+    # 7. 更正（附理由），原文与历次修订可查询
+    step("7. 带理由更正 T1#3（更正不改变依赖所指身份）")
     show("更正", call("PUT", f"/api/drills/{drill_id}/records/T1/3",
                       {"content": "完成第一轮堤段巡查（东段补巡 200m）",
                        "reason": "录入时遗漏东段补巡里程",
                        "revised_by": "值班长"}))
     show("记录+全部修订", call("GET", f"/api/drills/{drill_id}/records/T1/3"))
 
-    # 7. 封存前：缺号未闭合应被拒绝
-    step("7. 未闭合缺号时尝试封存 => 明确错误")
+    # 8. 封存前：缺号未闭合应被拒绝
+    step("8. 未闭合缺号时尝试封存 => 明确错误")
     show("封存被拒", call("POST", f"/api/drills/{drill_id}/seals", {"note": "第一次尝试"}))
 
-    # 8. 闭合缺号：T2#1 确认为丢失
-    step("8. 逐号确认 T2 缺号 1 丢失")
+    # 9. 闭合缺号：T2#1 确认为丢失
+    step("9. 逐号确认 T2 缺号 1 丢失")
     show("确认丢失", call("POST", f"/api/drills/{drill_id}/terminals/T2/gaps/lost",
                           {"seq": 1, "reason": "离线缓存损坏无法恢复",
                            "confirmed_by": "保障组"}))
 
-    # 9. 封存 v1
-    step("9. 封存版本 1（不可变快照）")
+    # 10. 封存 v1：快照同时固化当时的处置依赖与依据
+    step("10. 封存版本 1（不可变快照，含 dependencies）")
     show("封存", call("POST", f"/api/drills/{drill_id}/seals", {"note": "演练结束封存"}))
 
-    # 10. 封存后的迟到上报与更正：当前时间线接纳，封存版不变
-    step("10. 封存后迟到上报 T3#1（当前时间线接纳，封存版不变）")
+    # 11. 封存后的迟到上报与更正：当前时间线接纳，封存版不变
+    step("11. 封存后迟到上报 T3#1（当前时间线接纳，封存版不变）")
     show("迟到上报", call(
         "POST", f"/api/drills/{drill_id}/terminals/T3/reports",
         {"entries": [
             {"seq": 1, "occurred_at": "2026-10-05T09:40:00Z",
              "event_type": "command", "content": "指挥车回撤指令回执（迟到补报）"},
         ]}))
-    show("封存版本 1 仍为原样", call("GET", f"/api/drills/{drill_id}/seals/1"))
+    # 封存后撤销 T1#1 -> T1#3：只影响当前视图，封存 v1 中的依赖与依据不变
+    show("封存后撤销依赖（仅影响当前视图）",
+         call("DELETE", f"/api/drills/{drill_id}/dependencies", {
+             "predecessor": {"terminal_code": "T1", "seq": 1},
+             "successor": {"terminal_code": "T1", "seq": 3}}))
+    show("封存版本 1 仍保留当时依赖", call("GET", f"/api/drills/{drill_id}/seals/1"))
     show("当前时间线已含迟到数据", call("GET", f"/api/drills/{drill_id}/timeline"))
 
-    # 11. 非法场景
-    step("11. 错误场景")
+    # 12. 非法场景
+    step("12. 错误场景")
     show("未登记终端上报", call(
         "POST", f"/api/drills/{drill_id}/terminals/GHOST/reports",
         {"entries": [{"seq": 1, "occurred_at": "2026-10-05T09:00:00Z",
@@ -153,8 +202,8 @@ def main() -> None:
         {"entries": [{"seq": -3, "occurred_at": "2026-10-05T09:00:00Z",
                       "event_type": "x", "content": "y"}]}))
 
-    # 12. 主动完成：T3 只报了 1、3（缺 2），缺号未闭合时完成被拒
-    step("12. 主动完成：缺号未闭合 => 409 且不生成封存版本")
+    # 13. 主动完成：T3 只报了 1、3（缺 2），缺号未闭合时完成被拒
+    step("13. 主动完成：缺号未闭合 => 409 且不生成封存版本")
     show("T3 上报 3（缺 2）", call(
         "POST", f"/api/drills/{drill_id}/terminals/T3/reports",
         {"entries": [
@@ -164,8 +213,8 @@ def main() -> None:
     show("完成被拒", call("POST", f"/api/drills/{drill_id}/complete",
                           {"completed_by": "演练负责人"}))
 
-    # 13. 逐号确认 T3 缺号 2 丢失后，完成原子生成最终封存版本并转为已完成
-    step("13. 闭合缺号后完成 => 原子生成最终封存版本（201）")
+    # 14. 逐号确认 T3 缺号 2 丢失后，完成原子生成最终封存版本并转为已完成
+    step("14. 闭合缺号后完成 => 原子生成最终封存版本（201）")
     show("确认 T3#2 丢失", call("POST", f"/api/drills/{drill_id}/terminals/T3/gaps/lost",
                                 {"seq": 2, "reason": "终端掉电未缓存",
                                  "confirmed_by": "保障组"}))
@@ -173,10 +222,17 @@ def main() -> None:
                           {"note": "演练正式收官", "completed_by": "张指挥"}))
     show("演练状态（completed）", call("GET", f"/api/drills/{drill_id}"))
 
-    # 14. 完成后：变更类操作一律拒绝；相同内容重试仍 duplicate；冲突不新增证据
-    step("14. 完成后的拒绝语义")
+    # 15. 完成后：变更类操作一律拒绝；相同内容重试仍 duplicate；冲突不新增证据
+    step("15. 完成后的拒绝语义（含处置依赖变更）")
     show("登记终端被拒", call("POST", f"/api/drills/{drill_id}/terminals",
                               {"terminals": [{"code": "T9"}]}))
+    show("建立处置依赖被拒", call("PUT", f"/api/drills/{drill_id}/dependencies", {
+        "predecessor": {"terminal_code": "T1", "seq": 1},
+        "successor": {"terminal_code": "T3", "seq": 1},
+        "basis": "完成后试图建立依赖"}))
+    show("撤销处置依赖被拒", call("DELETE", f"/api/drills/{drill_id}/dependencies", {
+        "predecessor": {"terminal_code": "T1", "seq": 2},
+        "successor": {"terminal_code": "T2", "seq": 2}}))
     show("混合批次：重试=duplicate，新序号/冲突=rejected", call(
         "POST", f"/api/drills/{drill_id}/terminals/T1/reports",
         {"entries": [
@@ -194,11 +250,12 @@ def main() -> None:
                               {"seq": 1}))
     show("再次封存被拒", call("POST", f"/api/drills/{drill_id}/seals", {"note": "x"}))
 
-    # 15. 重复完成幂等返回同一最终版本；历史读取仍可用
-    step("15. 重复完成 => 同一最终版本（200）；历史读取仍可用")
+    # 16. 重复完成幂等返回同一最终版本；历史读取仍可用
+    step("16. 重复完成 => 同一最终版本（200）；历史读取仍可用")
     show("重复完成", call("POST", f"/api/drills/{drill_id}/complete",
                           {"note": "再次完成", "completed_by": "别人"}))
-    show("封存版本列表（is_final 标记）", call("GET", f"/api/drills/{drill_id}/seals"))
+    show("封存版本列表（is_final 标记、dependency_count）",
+         call("GET", f"/api/drills/{drill_id}/seals"))
     show("最终封存版本", call("GET", f"/api/drills/{drill_id}/seals/2"))
     show("历史时间线仍可读", call("GET", f"/api/drills/{drill_id}/timeline"))
 
